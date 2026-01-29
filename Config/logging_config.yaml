@@ -1,0 +1,41 @@
+version: 1
+disable_existing_loggers: False
+
+formatters:
+  detailed:
+    format: "%(asctime)s - %(name)s - %(levelname)s - [%(processName)s/%(threadName)s] - %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  simple:
+    format: "%(asctime)s - %(name)s - [%(levelname)s] - %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+
+handlers:
+  # 控制台处理器
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: simple
+    stream: ext://sys.stdout
+
+  # 滚转文件处理器：用于所有日志的统一存储
+  file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: detailed
+    filename: ../Logs/main.log
+    maxBytes: 10485760  # 10MB
+    backupCount: 5
+    encoding: 'utf-8'
+
+  # 队列处理器：将日志发送到队列，由监听器处理
+  queue_handler:
+    class: logging.handlers.QueueHandler
+    queue: ext://logging_queue # 这里会在Python代码中动态传入
+
+
+
+loggers: {}
+
+root:
+  level: DEBUG
+  handlers: [queue, console]
