@@ -2,17 +2,128 @@
 import logging
 import logging.config
 import logging.handlers
+from logging import Filter, LogRecord, Handler
 import yaml
 import os
+import sys
 import threading
 import queue
 from queue import Queue
-import os
-from typing import Optional, Tuple
+from typing import Optional, Dict, Set
+import atexit
+from pathlib import Path
+
+
+class ModuleFilter(Filter):
+    '''
+    精准模块过滤
+    '''
+
+    def __init__(self, module_prefix: str):
+        super().__init__()
+        self.module_prefix = module_prefix.rstrip('.') + '.'
+        self.exact_match = module_prefix.endswith('*')  # 是否精确匹配
+        if self.exact_match:
+            self.module_prefix = module_prefix[:-1].rstrip('.')  # 移除'*'
+
+    def filter(self, record: LogRecord) -> bool:
+        if self.exact_match:
+            return record.name == self.module_prefix.rstrip('.')
+        return record.name.startswith(self.module_prefix)
+
+class DynamicModuleRegistry:
+    '''
+    动态注册模块，运行时新增模块
+    '''
+
+    _instance=None
+    _lock=threading.RLock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance=super().__new__(cls)
+                    cls._instance._init()
+        return cls._instance
+
+    def _init(self):
+        self.registered_modules: Set[str]=set()
+        self.module_configs:Dict[str,tuple]={} # {prefix: (filename,level)}
+        self._logger=logging.getLogger('log.registry')
+
+    def register_module(self,prefix:str,filename:str,level: int=logging.DEBUG):
+        '''
+        注册新模块
+        :param prefix: 日志器
+        :param filename: 文件存储位置
+        :param level: 日志等
+        :return:
+        '''
+        with self._lock:
+            if prefix in self.registered_modules:
+                self._logger.debug(f"Module '{prefix}' already registered")
+                return
+
+            self.registered_modules.add(prefix)
+            self.module_configs[prefix]=(filename,level)
+            self._logger.info(f"Registered new log module: {prefix} -> {filename} (level={logging.getLevelName(level)})")
+
+    def get_all_configs(self) -> Dict[str,tuple]:
+        with self._lock:
+            return dict(self.module_configs)
+
+class SmartQueueListener(logging.handlers.QueueListener):
+    '''
+    - 自动创建模块化日志文件
+    - 线程安全处理器管理
+    - 单个处理器失败不影响全局
+    - 动态模块注册支持
+    - atexit清理，防止资源泄漏
+    '''
+    def __init__(
+            self,
+            log_queue:queue.Queue,
+            log_dir:str='../logs',
+            main_log_config:tuple=("main.log",10*1024*1024,5,'utf-8'),
+            module_log_config:tuple=(5*1024*1024,3,'utf-8'),
+            console_handler:Optional[Handler]=None
+    ):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True,exist_ok=True)
+        self.main_log_config=main_log_config
+        self.module_log_config=module_log_config
+        self.console_handler=console_handler
+
+        self._handlers:Dict[str,Handler]={}
+        self._lock=threading.RLock()
+        self._shutdown=False
+        self._registry=DynamicModuleRegistry()
+
+        # 创建处理器
+        self._create_all_handlers()
+
+        # 注册退出清理
+        atexit.register(self.stop)
+
+        # 启动消费者线程
+        self._thread=threading.Thread(
+            target=self._monitor_queue,
+            name="LogConsumerThread",
+            daemon=True
+        )
+        self._thread.start()
+        logging.getLogger('log.listener').info(f"SmartQueueListener started. Logs dir:{self.log_dir.absolute()}")
+
+    def _create_all_handlers(self):
+        '''
+        创建所有日志处理器，主日志+模块日志+动态注册模块
+        :return:
+        '''
 
 
 class LogManager:
-    def __init__(self, config_path: str = '../Config/logging_config.yaml'):
+    def __init__(self, config_path: str = '../config/logging_config.yaml'):
         '''
         初始化日志管理器
         :param config_path: 日志配置文件(yaml)的路径
@@ -47,13 +158,12 @@ class LogManager:
         else:
             self.logger.warning("配置文件中可能缺少'queue_handler' handler.这可能导致队列监听器无法工作。")
 
-
         # 加载日志配置
         logging.config.dictConfig(config)
         # 设置队列监听器
         # 创建一个独立的处理器
         file_handler = logging.handlers.RotatingFileHandler(
-            '../Logs/main.log', maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
+            '../logs/main.log', maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
         )
 
         file_handler.setLevel(logging.DEBUG)
