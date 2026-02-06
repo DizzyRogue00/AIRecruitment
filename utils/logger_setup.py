@@ -12,6 +12,7 @@ from queue import Queue
 from typing import Optional, Dict, Set
 import atexit
 from pathlib import Path
+from contextlib import suppress
 
 
 class ModuleFilter(Filter):
@@ -55,9 +56,9 @@ class DynamicModuleRegistry:
     def register_module(self,prefix:str,filename:str,level: int=logging.DEBUG):
         '''
         注册新模块
-        :param prefix: 日志器
+        :param prefix: 处理器
         :param filename: 文件存储位置
-        :param level: 日志等
+        :param level: 日志等级
         :return:
         '''
         with self._lock:
@@ -85,10 +86,11 @@ class SmartQueueListener(logging.handlers.QueueListener):
             self,
             log_queue:queue.Queue,
             log_dir:str='../logs',
-            main_log_config:tuple=("main.log",10*1024*1024,5,'utf-8'),
-            module_log_config:tuple=(5*1024*1024,3,'utf-8'),
+            main_log_config:tuple=("main.log",10*1024*1024,5),
+            module_log_config:tuple=(5*1024*1024,3),
             console_handler:Optional[Handler]=None
     ):
+        self._queue=log_queue or queue.Queue(-1)
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True,exist_ok=True)
         self.main_log_config=main_log_config
@@ -117,9 +119,183 @@ class SmartQueueListener(logging.handlers.QueueListener):
 
     def _create_all_handlers(self):
         '''
-        创建所有日志处理器，主日志+模块日志+动态注册模块
+        创建所有日志处理器，主日志handler+模块日志handler+动态注册模块
         :return:
         '''
+        # 创建主日志处理器
+        main_file,main_max_bytes,main_backup_count=self.main_log_config
+        main_handler=logging.handlers.RotatingFileHandler(
+            filename=self.log_dir / main_file,
+            maxBytes=main_max_bytes,
+            backupCount=main_backup_count,
+            encoding='utf-8'
+        )
+        main_handler.setFormatter(self._get_formatter("detailed"))
+        main_handler.setLevel(logging.DEBUG)
+        self._handlers["main"]=main_handler
+
+       # 预定义其他日志处理器
+        base_configs=[
+            ("detector.face","face.log",logging.DEBUG),
+            ("detector.hand", "hand.log", logging.DEBUG),
+            ("detector.pose", "pose.log", logging.DEBUG),
+            ("integrator","integrator.log",logging.INFO),
+            ("frame_publisher","frame_publisher.log",logging.INFO),
+            ("system","system.log",logging.INFO),
+            ("__main__","main_app.log",logging.INFO)
+        ]
+
+        # 添加动态注册的handler信息
+        for prefix,(filename,level) in self._registry.get_all_configs():
+            base_configs.append((prefix,filename,level))
+
+        # 创建模块处理器
+        for prefix, filename, level in base_configs:
+            try:
+                handler=logging.handlers.RotatingFileHandler(
+                    filename=self.log_dir / filename,
+                    maxBytes=self.module_log_config[0],
+                    backupCount=self.module_log_config[1],
+                    encoding='utf-8'
+                )
+                handler.setFormatter(self._get_formatter("detailed"))
+                handler.setLevel(level)
+                handler.addFilter(ModuleFilter(prefix))
+                self._handlers[prefix]=handler
+                logging.getLogger('log.listener').debug(f"Created handler for module: {prefix} -> {filename}")
+            except Exception as e:
+                logging.getLogger('log.listener').error(f"Failed to create handler for {prefix}: {e}",exc_info=True)
+
+    def _get_formatter(self,style:str):
+        fmts={
+            "detailed": "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - [%(processName)s/%(threadName)s] - %(funcName)s:%(lineno)d - %(message)s",
+            "simple": "%(asctime)s - %(name)s - [%(levelname)s] - %(message)s"
+        }
+        return logging.Formatter(fmts[style],datefmt="%Y-%m-%d %H:%M:%S")
+
+    def _monitor_queue(self):
+        """
+        带异常隔离的消费队列
+        :return:
+        """
+        while not self._shutdown:
+            try:
+                #record=self.queue.get(timeout=0.5)
+                record=self._queue.get()
+                if record is None:
+                    break
+                self._dispatch_record(record)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                # 监听器自身发生故障
+                try:
+                    sys.stderr.write(f"[LOG-LISTENER-ERROR] {type(e).__name__}: {e}\n")
+                except:
+                    pass
+
+    def _dispatch_record(self,record:LogRecord):
+        """
+        日志分发策略
+        :param record:
+        :return:
+        """
+        for handler_name,handler in self._handlers.items():
+            try:
+                if handler.level<=record.levelno:
+                    handler.handle(record)
+            except Exception as e:
+                # 单个处理器失效不影响其他处理器
+                with suppress(BaseException):
+                    sys.stderr.write(
+                        f"[HANDLER-FAILURE] handler '{handler_name}' failed: {type(e).__name__}\n"
+                        f"Record: {record.name}:{record.levelname} | {record.getMessage()}\n"
+                    )
+
+    def add_module_handler(self,prefix:str,filename:str,level:int=logging.DEBUG):
+        '''
+        运行时动态加载处理器模块
+        :param prefix: 处理器模块名
+        :param filename: 日志存储的文件
+        :param level: 等级
+        :return:
+        '''
+        with self._lock:
+            if prefix in self._handlers:
+                logging.getLogger('log.listener').warning(f"Handler for '{prefix}' already exists")
+                return
+
+            try:
+                handler=logging.handlers.RotatingFileHandler(
+                    filename=self.log_dir / filename,
+                    maxBytes=self.module_log_config[0],
+                    backupCount=self.module_log_config[1],
+                    encoding='utf-8'
+                )
+                handler.setFormatter(self._get_formatter("detailed"))
+                handler.setLevel(level)
+                handler.addFilter(ModuleFilter(prefix))
+                self._handlers[prefix]=handler
+                self._registry.register_module(prefix,filename,level)
+                logging.getLogger('log.listener').info(f"Dynamically added handler: {prefix} -> {filename}")
+            except Exception as e:
+                logging.getLogger('log.listener').error(f"Failed to add dynamic handler for {prefix}: {e}",exc_info=True)
+
+    def stop(self):
+        '''
+        停止，清理资源
+        :return:
+        '''
+        if self._shutdown:
+            return
+
+        self._shutdown=True
+
+        # 线程退出
+        with suppress(BaseException):
+            self._queue.put_nowait(None)
+
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+        # 清理日志器
+        with self._lock:
+            for name,handler in self._handlers.items():
+                try:
+                    handler.close()
+                except Exception as e:
+                    if not isinstance(e,OSError):
+                        sys.stderr.write(f"[CLEANUP-ERROR] Failed to close handler '{name}': {e}\n")
+            self._handlers.clear()
+
+        # 清理控制台
+        if self.console_handler:
+            with suppress(BaseException):
+                self.console_handler.close()
+        logging.getLogger('log.listener').info("SmartQueueListener stopped and resources cleaned")
+
+    @property
+    def queue(self) -> queue.Queue:
+        with self._lock:
+            return self._queue
+
+    @queue.setter
+    def queue(self,new_queue:queue.Queue):
+        '''
+        替换正在使用的日志队列。
+        注意：这是一个高级操作，应谨慎使用。通常在停止监听器后更换队列再重启，
+        或确保新旧队列之间的平滑过渡，以避免日志丢失。
+        :param new_queue:
+        :return:
+        '''
+        if not isinstance(new_queue,queue.Queue):
+            raise TypeError(f"新的队列必输是queue.Queue的实例")
+
+        with self._lock:
+            old_queue=self._queue
+            self._queue=new_queue
+            logging.getLogger('log.listener').info(f"Log queue replaced. Old: {id(old_queue)}, New: {id(new_queue)}")
+
 
 
 class LogManager:
