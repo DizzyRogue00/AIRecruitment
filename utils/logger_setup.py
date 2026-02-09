@@ -253,7 +253,7 @@ class SmartQueueListener(logging.handlers.QueueListener):
 
         # 线程退出
         with suppress(BaseException):
-            self._queue.put_nowait(None)
+            self._queue.put_nowait(None) # 
 
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
@@ -296,79 +296,169 @@ class SmartQueueListener(logging.handlers.QueueListener):
             self._queue=new_queue
             logging.getLogger('log.listener').info(f"Log queue replaced. Old: {id(old_queue)}, New: {id(new_queue)}")
 
-
-
 class LogManager:
-    def __init__(self, config_path: str = '../config/logging_config.yaml'):
+    _instances: Dict[str,'LogManager']={}
+    _lock=threading.Lock()
+
+    def __new__(cls,config_path:str=None):
+        if config_path is None:
+            config_path='../config/logging_config.yaml'
+
+        config_path=os.path.abspath(config_path)
+
+        if config_path not in cls._instances:
+            with cls._lock:
+                if config_path not in cls._instances:
+                    instance=super().__new__(cls)
+                    instance._config_path=config_path
+                    instance._initialized=False
+                    cls._instances[config_path]=instance
+        return cls._instances[config_path]
+
+    def __init__(self, config_path: str = None):
         '''
         初始化日志管理器
         :param config_path: 日志配置文件(yaml)的路径
         '''
+        if self._initialized:
+            # 单例模式
+            return
+        if config_path is None:
+            config_path='../config/logging_config.yaml'
+
         self.config_path = config_path
-        self._logging_queue: Optional[Queue] = None
-        self._listener: Optional[logging.handlers.QueueListener] = None
-        self._listener_thread: Optional[threading.Thread] = None
-        self._stop_event: Optional[threading.Event] = None
+        self._logging_queue: Optional[queue.Queue] = None
+        self._listener: Optional[SmartQueueListener] = None
+        #self._stop_event: Optional[threading.Event] = None
+        self._stop_event = threading.Event()
+        self._initialized=True
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def setup_logging(self):
+    @classmethod
+    def get_instance(cls,config_path:str=None) -> 'LogManager':
+        '''
+        获取实例
+        :param config_path:
+        :return:
+        '''
+        return cls(config_path)
+
+    @classmethod
+    def get_default_instance(cls) -> 'LogManager':
+        '''
+        获取默认配置的实例
+        :return:
+        '''
+        return cls.get_instance('../config/logging_config.yaml')
+
+    @classmethod
+    def cleanup(cls,config_path:str=None):
+        '''
+        清理指定配置实例
+        :param config_path:
+        :return:
+        '''
+        with cls._lock:
+            if config_path:
+                config_path=os.path.abspath(config_path)
+                if config_path in cls._instances:
+                    del cls._instances[config_path]
+            else:
+                cls._instances.clear()
+
+    @classmethod
+    def count_instances(cls) -> int:
+        '''
+        统计有多少个不同配置的实例
+        :return:
+        '''
+        return len(cls._instances)
+
+    def setup_logging(self,log_dir:str="../logs") -> bool:
         '''
         加载日志配置并启动队列监听器
         Raises:
             FileNotFoundError: 如果指定的配置文件不存在
             yaml.YAMLError: 如果配置文件格式错误
-        :return:
+        :return: 初始化是否成功
         '''
-        if not os.path.exists(self.config_path):
-            raise FileNotFoundError(f"日志配置文件未找到: {self.config_path}")
+        try:
+            # 验证配置文件
+            if not os.path.exists(self.config_path):
+                raise FileNotFoundError(f"日志配置文件未找到: {os.path.abspath(self.config_path)}")
+            # 加载yaml文件
+            with open(self.config_path, 'rt', encoding='utf-8') as f:
+                config = yaml.safe_load(f.read())
 
-        with open(self.config_path, 'rt', encoding='utf-8') as f:
-            config = yaml.safe_load(f.read())
+            # 创建全局队列
+            # 队列必须在应用配置加载前创建，并注入到配置中
+            self._logging_queue = queue.Queue(-1)
+            #self._logging_queue=queue.Queue(maxsize=1000)
 
-        # 创建全局队列
-        # 队列必须在应用配置加载前创建，并注入到配置中
-        self._logging_queue = queue.Queue(-1)
+            if 'handlers' in config and 'queue_handler' in config['handlers']:
+                config['handlers']['queue_handler']['queue'] = self._logging_queue
+            else:
+                self.logger.warning("配置文件中可能缺少'queue_handler' handler.这可能导致队列监听器无法工作。")
+                if 'handlers' not in config:
+                    config['handlers']={}
+                config['handlers']['queue_handler']={
+                    'class':'logging.handlers.QueueHandler',
+                    'queue':self._logging_queue,
+                    'level':'DEBUG'
+                }
+                if 'root' in config and 'handlers' in config['root']:
+                    if 'queue_handler' not in config['root']['handlers']:
+                        config['root']['handlers'].append('queue_handler')
 
-        if 'handlers' in config and 'queue_handler' in config['handlers']:
-            config['handlers']['queue_handler']['queue'] = self._logging_queue
-        else:
-            self.logger.warning("配置文件中可能缺少'queue_handler' handler.这可能导致队列监听器无法工作。")
+            # 禁止第三方库冗余日志
+            config.setdefault('loggers',{})
+            noisy_loggers={
+                'matplotlib':{'level':'WARNING','propagate':False},
+                'PIL': {'level': 'WARNING', 'propagate': False},
+                'urllib3': {'level': 'WARNING', 'propagate': False},
+                'asyncio': {'level': 'WARNING', 'propagate': False},
+            }
 
-        # 加载日志配置
-        logging.config.dictConfig(config)
-        # 设置队列监听器
-        # 创建一个独立的处理器
-        file_handler = logging.handlers.RotatingFileHandler(
-            '../logs/main.log', maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8'
-        )
+            for logger_name,cfg in noisy_loggers.items():
+                if logger_name not in config['loggers']:
+                    config['loggers'][logger_name]=cfg
+            # 加载日志配置 root logger的处理器为console和queue_handlers
+            logging.config.dictConfig(config)
 
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(
-            fmt="%(asctime)s - %(name)s - %(levelname)s - [%(processName)s/%(threadName)s] - %(message)s",
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
+            # 创建并启动监听线程
+            console_handler=None
+            root_logger=logging.getLogger()
+            for h in root_logger.handlers:
+                if isinstance(h,logging.StreamHandler) and h.stream==sys.stdout:
+                    console_handler=h
+                    break
 
-        # 创建并启动监听线程
-        self._listener = logging.handlers.QueueListener(self._logging_queue, file_handler)
+            self._listener=SmartQueueListener(
+                log_queue=self._logging_queue,
+                log_dir=log_dir,
+                console_handler=console_handler
+            )
 
-        self._stop_event = threading.Event()
-
-        def _run_listener():
-            self.logger.info("日志队列监听器线程已启动。")
-            self._listener.start()
-
-            try:
-                # 监听停止事件，直到被设置
-                while not self._stop_event.is_set():
-                    self._stop_event.wait(timeout=0.2)
-            finally:
-                self._listener.stop()
-                self.logger.info("日志队列监听器线程已停止。")
-
-        self._listener_thread = threading.Thread(target=_run_listener, daemon=True, name="LogManagerListenerThread")
-        self._listener_thread.start()
-
-        self.logger.info(f"日志系统已通过 {self.__class__.__name__} 初始化并启动。")
+            # 验证初始化
+            test_logger=logging.getLogger('system.init')
+            test_logger.info("=" * 60)
+            test_logger.info("企业级日志系统初始化成功")
+            test_logger.info(f"日志目录: {Path(log_dir).resolve()}")
+            test_logger.info(f"队列监听器: {self._listener.__class__.__name__}")
+            test_logger.info(f"已注册模块: {len(self._listener._handlers)} 个处理器")
+            test_logger.info(f"动态注册API: LogManager.instance().listener.add_module_handler()")
+            test_logger.info("=" * 60)
+            return True
+        except Exception as e:
+            # 初始化失败
+            print(f"[CRITICAL] 日志系统初始化失败: {e}",file=sys.stderr)
+            print("回退到基础控制台日志...",file=sys.stderr)
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s - [%(levelname)s] - %(message)s',
+                handlers=[logging.StreamHandler(sys.stderr)]
+            )
+            return False
 
     def stop_logging(self, timeout: Optional[float] = None):
         '''
@@ -377,23 +467,10 @@ class LogManager:
         :return:
         '''
 
-        if self._stop_event:
-            self.logger.info("正在请求停止日志队列监听器...")
-            self._stop_event.set()  # 发送停止信号
+        if not self._listener:
+            return
 
-        if self._listener_thread and self._listener_thread.is_alive():
-            self.logger.info(f"等待监听器线程 '{self._listener_thread.name}' 结束...")
-            self._listener_thread.join(timeout=timeout)  # 等待线程结束
+        self.logger.info("正在停止日志系统")
+        self._listener.stop()
+        self.logger.info("日志系统已安全停止")
 
-            if self._listener_thread.is_alive():
-                self.logger.warning(f"监听器线程 '{self._listener_thread.name}' 在超时后仍未结束")
-            else:
-                self.logger.info("监听器线程已成功结束。")
-        else:
-            self.logger.info("监听器线程不存在或已经结束")
-
-        # 清理资源
-        self._logging_queue = None
-        self._listener = None
-        self._listener_thread = None
-        self._stop_event = None

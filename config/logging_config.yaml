@@ -17,15 +17,15 @@ handlers:
     formatter: simple
     stream: ext://sys.stdout
 
-  # 滚转文件处理器：用于所有日志的统一存储
-  file_handler:
-    class: logging.handlers.RotatingFileHandler
-    level: DEBUG
-    formatter: detailed
-    filename: ../logs/main.log
-    maxBytes: 10485760  # 10MB
-    backupCount: 5
-    encoding: 'utf-8'
+#  # 滚转文件处理器：用于所有日志的统一存储
+#  file_handler:
+#    class: logging.handlers.RotatingFileHandler
+#    level: DEBUG
+#    formatter: detailed
+#    filename: ../logs/main.log
+#    maxBytes: 10485760  # 10MB
+#    backupCount: 5
+#    encoding: 'utf-8'
 
   # 队列处理器：将日志发送到队列，由监听器处理
   queue_handler:
