@@ -13,6 +13,7 @@ from typing import Optional, Dict, Set
 import atexit
 from pathlib import Path
 from contextlib import suppress
+import time
 
 
 class ModuleFilter(Filter):
@@ -30,6 +31,7 @@ class ModuleFilter(Filter):
     def filter(self, record: LogRecord) -> bool:
         if self.exact_match:
             return record.name == self.module_prefix.rstrip('.')
+        #prefix_without_dot=self.module_prefix.rstrip('.')
         return record.name.startswith(self.module_prefix)
 
 class DynamicModuleRegistry:
@@ -93,11 +95,13 @@ class SmartQueueListener(logging.handlers.QueueListener):
         self._queue=log_queue or queue.Queue(-1)
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True,exist_ok=True)
+
         self.main_log_config=main_log_config
         self.module_log_config=module_log_config
-        self.console_handler=console_handler
 
+        self.console_handler=console_handler
         self._handlers:Dict[str,Handler]={}
+
         self._lock=threading.RLock()
         self._shutdown=False
         self._registry=DynamicModuleRegistry()
@@ -180,8 +184,8 @@ class SmartQueueListener(logging.handlers.QueueListener):
         """
         while not self._shutdown:
             try:
-                #record=self.queue.get(timeout=0.5)
-                record=self._queue.get()
+                record=self.queue.get(timeout=0.1)
+                #record=self._queue.get()
                 if record is None:
                     break
                 self._dispatch_record(record)
@@ -200,7 +204,11 @@ class SmartQueueListener(logging.handlers.QueueListener):
         :param record:
         :return:
         """
-        for handler_name,handler in self._handlers.items():
+        # 加锁获取当前处理器快照，避免迭代时字典被修改
+        with self._lock:
+             handlers_snapshot=list(self._handlers.items()) # 创建安全快照
+        #for handler_name,handler in self._handlers.items():
+        for handler_name, handler in handlers_snapshot:
             try:
                 if handler.level<=record.levelno:
                     handler.handle(record)
@@ -241,7 +249,7 @@ class SmartQueueListener(logging.handlers.QueueListener):
             except Exception as e:
                 logging.getLogger('log.listener').error(f"Failed to add dynamic handler for {prefix}: {e}",exc_info=True)
 
-    def stop(self):
+    def stop(self,timeout:float=3.0):
         '''
         停止，清理资源
         :return:
@@ -253,11 +261,29 @@ class SmartQueueListener(logging.handlers.QueueListener):
 
         # 线程退出
         with suppress(BaseException):
-            self._queue.put_nowait(None) # 
+            self._queue.put_nowait(None) #
 
         if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=min(timeout,2.0) if timeout else 2.0)
 
+        # 等待队列中剩余的日志被处理
+        remaining=self._queue.qsize()
+        if remaining>0:
+            for _ in range(remaining):
+                try:
+                    #record = self.queue.get(timeout=0.1)
+                    record = self.queue.get_nowait()
+                    # record=self._queue.get()
+                    if record is not None:
+                        self._dispatch_record(record)
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    # 监听器自身发生故障
+                    try:
+                        sys.stderr.write(f"[LOG-LISTENER-ERROR] {type(e).__name__}: {e}\n")
+                    except:
+                        pass
         # 清理日志器
         with self._lock:
             for name,handler in self._handlers.items():
@@ -280,7 +306,7 @@ class SmartQueueListener(logging.handlers.QueueListener):
             return self._queue
 
     @queue.setter
-    def queue(self,new_queue:queue.Queue):
+    def queue(self,new_queue:queue):
         '''
         替换正在使用的日志队列。
         注意：这是一个高级操作，应谨慎使用。通常在停止监听器后更换队列再重启，
@@ -470,7 +496,37 @@ class LogManager:
         if not self._listener:
             return
 
-        self.logger.info("正在停止日志系统")
-        self._listener.stop()
+        self.logger.info("正在停止日志系统...")
+        self._listener.stop(timeout)
         self.logger.info("日志系统已安全停止")
 
+    @property
+    def listener(self) -> Optional[SmartQueueListener]:
+        '''
+        提供监听器的引用，便于全局动态注册模块
+        :return:
+        '''
+        return self._listener
+
+# 全局函数
+def get_logger(name: str) -> logging.Logger:
+    """
+    获取已经配置的日志器
+    :param name:
+    :return:
+    """
+    return logging.getLogger(name)
+
+def registry_log_module(config_path:str,prefix:str,filename:str,level:int=logging.DEBUG):
+    """
+    全局函数：动态注册新日志模块
+    :param prefix:
+    :param filename:
+    :param level:
+    :return:
+    """
+    manager=LogManager.get_instance(config_path)
+    if manager.listener:
+        manager.listener.add_module_handler(prefix,filename,level)
+    else:
+        logging.warning(f"LogManager 未初始化未加载日志器，无法注册模块： {prefix}")
