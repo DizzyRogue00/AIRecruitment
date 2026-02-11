@@ -1,4 +1,5 @@
 # logger_setup.py
+import inspect
 import logging
 import logging.config
 import logging.handlers
@@ -15,6 +16,22 @@ from pathlib import Path
 from contextlib import suppress
 import time
 
+# 装饰器
+def log_with_line_info(line_offset=0):
+    def decorater(func):
+        def wrapper(*args, **kwargs):
+            # 获取当前帧和调用者信息
+            current_frame = inspect.currentframe()
+            caller_frame = current_frame.f_back.f_back  # 被装饰函数有一层包装
+
+            # 获取装饰器调用位置的行号
+            decorater_lineno = current_frame.f_back.f_lineno
+
+            return func(*args, **kwargs, caller_frame=caller_frame, source_lineno=decorater_lineno + line_offset)
+
+        return wrapper
+
+    return decorater
 
 class ModuleFilter(Filter):
     '''
@@ -32,7 +49,7 @@ class ModuleFilter(Filter):
         if self.exact_match:
             return record.name == self.module_prefix.rstrip('.')
         #prefix_without_dot=self.module_prefix.rstrip('.')
-        return record.name.startswith(self.module_prefix)
+        return (record.name == self.module_prefix.rstrip('.') or record.name.startswith(self.module_prefix))
 
 class DynamicModuleRegistry:
     '''
@@ -187,10 +204,33 @@ class SmartQueueListener(logging.handlers.QueueListener):
                 record=self.queue.get(timeout=0.1)
                 #record=self._queue.get()
                 if record is None:
+                    self._process_remaining_records()
                     break
                 self._dispatch_record(record)
             except queue.Empty:
                 continue
+            except Exception as e:
+                # 监听器自身发生故障
+                try:
+                    sys.stderr.write(f"[LOG-LISTENER-ERROR] {type(e).__name__}: {e}\n")
+                except:
+                    pass
+
+        # 线程结束前的最后检查
+        self._process_remaining_records()
+
+    def _process_remaining_records(self):
+        '''
+        处理队列中剩余的记录
+        :return:
+        '''
+        while True:
+            try:
+                record=self._queue.get_nowait()
+                if record is not None:
+                    self._dispatch_record(record)
+            except queue.Empty:
+                break
             except Exception as e:
                 # 监听器自身发生故障
                 try:
@@ -249,6 +289,20 @@ class SmartQueueListener(logging.handlers.QueueListener):
             except Exception as e:
                 logging.getLogger('log.listener').error(f"Failed to add dynamic handler for {prefix}: {e}",exc_info=True)
 
+
+    @log_with_line_info(line_offset=1)
+    def _create_log_record(self,name,msg,caller_frame,source_lineno):
+        return logging.LogRecord(
+            name=name,
+            level=logging.INFO,
+            pathname=caller_frame.f_code.co_filename,
+            lineno=source_lineno,
+            msg=msg,
+            args=(),
+            exc_info=None,
+            func=caller_frame.f_code.co_name
+        )
+
     def stop(self,timeout:float=3.0):
         '''
         停止，清理资源
@@ -268,7 +322,7 @@ class SmartQueueListener(logging.handlers.QueueListener):
 
         # 等待队列中剩余的日志被处理
         remaining=self._queue.qsize()
-        if remaining>0:
+        if not self._thread.is_alive() and remaining>0:
             for _ in range(remaining):
                 try:
                     #record = self.queue.get(timeout=0.1)
@@ -284,6 +338,32 @@ class SmartQueueListener(logging.handlers.QueueListener):
                         sys.stderr.write(f"[LOG-LISTENER-ERROR] {type(e).__name__}: {e}\n")
                     except:
                         pass
+
+        # 在清理日志前，构造标准的LogRecord（绕过已停止的队列线程）
+        try:
+            current_frame=inspect.currentframe()
+            caller_frame=current_frame.f_back # 获取调用者的帧
+
+            stop_listener_record=self._create_log_record(
+                name='log.listener',
+                msg="SmartQueueListener stopped and resources cleaned (main.log)",
+                caller_frame=caller_frame
+            )
+            self._dispatch_record(stop_listener_record)
+            stop_record = self._create_log_record(
+                name='LogManager',
+                msg="日志系统已安全停止 (main.log)",
+                caller_frame=caller_frame
+            )
+            self._dispatch_record(stop_record)
+        except Exception as e:
+            with suppress(BaseException):
+                sys.stderr.write(f"[STOP-LOG-FAILURE] Failed to close handler '{type(e).__name__}': {e}\n")
+        finally:
+            # 清理帧以避免循环引用
+            del current_frame
+            del caller_frame
+
         # 清理日志器
         with self._lock:
             for name,handler in self._handlers.items():
@@ -298,7 +378,7 @@ class SmartQueueListener(logging.handlers.QueueListener):
         if self.console_handler:
             with suppress(BaseException):
                 self.console_handler.close()
-        logging.getLogger('log.listener').info("SmartQueueListener stopped and resources cleaned")
+        logging.getLogger('log.listener').info("SmartQueueListener stopped and resources cleaned (console)")
 
     @property
     def queue(self) -> queue.Queue:
@@ -530,3 +610,4 @@ def registry_log_module(config_path:str,prefix:str,filename:str,level:int=loggin
         manager.listener.add_module_handler(prefix,filename,level)
     else:
         logging.warning(f"LogManager 未初始化未加载日志器，无法注册模块： {prefix}")
+

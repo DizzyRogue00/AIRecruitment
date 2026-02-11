@@ -4,7 +4,7 @@ import logging
 from utils import LogManager, registry_log_module,get_logger
 
 log_mgr=LogManager('../config/logging_config.yaml')
-
+#atexit.register(log_mgr.stop_logging)
 if not log_mgr.setup_logging(log_dir='../logs/prod'):
     raise RuntimeError("日志系统初始化失败！")
 
