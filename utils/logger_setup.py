@@ -18,20 +18,31 @@ import time
 
 # 装饰器
 def log_with_line_info(line_offset=0):
-    def decorater(func):
+    def decorator(func):
         def wrapper(*args, **kwargs):
-            # 获取当前帧和调用者信息
-            current_frame = inspect.currentframe()
-            caller_frame = current_frame.f_back.f_back  # 被装饰函数有一层包装
+            current_frame=None
+            caller_frame=None
+            try:
+                # 获取当前帧和调用者信息
+                current_frame = inspect.currentframe()
+                caller_frame = current_frame.f_back
 
-            # 获取装饰器调用位置的行号
-            decorater_lineno = current_frame.f_back.f_lineno
+                # 获取装饰器调用位置的行号
+                filename=caller_frame.f_code.co_filename
+                lineno=caller_frame.f_lineno+line_offset
+                funcname=caller_frame.f_code.co_name
 
-            return func(*args, **kwargs, caller_frame=caller_frame, source_lineno=decorater_lineno + line_offset)
+            finally:
+                del current_frame
+                del caller_frame
 
+            kwargs['caller_filename']=filename
+            kwargs['caller_lineno']=lineno
+            kwargs['caller_funcname']=funcname
+
+            return func(*args, **kwargs)
         return wrapper
-
-    return decorater
+    return decorator
 
 class ModuleFilter(Filter):
     '''
@@ -290,17 +301,17 @@ class SmartQueueListener(logging.handlers.QueueListener):
                 logging.getLogger('log.listener').error(f"Failed to add dynamic handler for {prefix}: {e}",exc_info=True)
 
 
-    @log_with_line_info(line_offset=1)
-    def _create_log_record(self,name,msg,caller_frame,source_lineno):
+    @log_with_line_info(line_offset=0)
+    def _create_log_record(self,name,msg,caller_filename,caller_lineno,caller_funcname):
         return logging.LogRecord(
             name=name,
             level=logging.INFO,
-            pathname=caller_frame.f_code.co_filename,
-            lineno=source_lineno,
+            pathname=caller_filename,
+            lineno=caller_lineno,
             msg=msg,
             args=(),
             exc_info=None,
-            func=caller_frame.f_code.co_name
+            func=caller_funcname
         )
 
     def stop(self,timeout:float=3.0):
@@ -341,28 +352,19 @@ class SmartQueueListener(logging.handlers.QueueListener):
 
         # 在清理日志前，构造标准的LogRecord（绕过已停止的队列线程）
         try:
-            current_frame=inspect.currentframe()
-            caller_frame=current_frame.f_back # 获取调用者的帧
-
             stop_listener_record=self._create_log_record(
                 name='log.listener',
                 msg="SmartQueueListener stopped and resources cleaned (main.log)",
-                caller_frame=caller_frame
             )
             self._dispatch_record(stop_listener_record)
             stop_record = self._create_log_record(
                 name='LogManager',
                 msg="日志系统已安全停止 (main.log)",
-                caller_frame=caller_frame
             )
             self._dispatch_record(stop_record)
         except Exception as e:
             with suppress(BaseException):
                 sys.stderr.write(f"[STOP-LOG-FAILURE] Failed to close handler '{type(e).__name__}': {e}\n")
-        finally:
-            # 清理帧以避免循环引用
-            del current_frame
-            del caller_frame
 
         # 清理日志器
         with self._lock:
