@@ -13,6 +13,7 @@ class DetectionType(Enum):
 @dataclass
 class FrameData:
     frame_id: int
+    timestamp_ms: int
     timestamp: float
     bgr_frame: np.ndarray # 原始BGR帧
     rgb_frame: np.ndarray # RGB副本
