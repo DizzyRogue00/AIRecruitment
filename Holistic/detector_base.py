@@ -17,7 +17,7 @@ class BaseDetector(abc.ABC):
             self,
             detection_type:DetectionType,
             model_path:str,
-            result_buffer,
+            result_buffer, # 帧缓冲区
             logger_name:str,
             min_interval_ms:float=16.0,
             cleanup_threshold:Optional[float]=None
@@ -42,13 +42,13 @@ class BaseDetector(abc.ABC):
         self._cleanup_threshold=cleanup_threshold if cleanup_threshold else 5.0 # 秒，清理过期的帧映射
         self._orphan_count=0
         self._orphan_warn_time=0.0
-        self._submit_count=0
+        self._submit_count=0 # 清除过期帧，每隔几个帧清除
 
         # 流程控制与性能
-        self._last_submit_time=0.0
+        self._last_submit_time=0.0 # 上一次提交帧
         self._min_interval=min_interval_ms/1000.0
         self._frame_count=0
-        self._total_latency=0.0
+        #self._total_latency=0.0
         self._last_stats_time=time.time()
         self._start_time=time.time()
 
@@ -82,7 +82,7 @@ class BaseDetector(abc.ABC):
     def _safe_callback_wrapper(self,result,output_image,timestamp_ms):
         '''
         mediapipe回调函数
-        :param result:
+        :param result: mp.tasks.vision.HandLandmarkerResult
         :param output_image: mp.Image
         :param timestamp_ms:  int 应与提交时一致
         :return:

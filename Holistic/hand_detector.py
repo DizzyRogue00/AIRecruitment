@@ -80,21 +80,21 @@ class HandDetector(BaseDetector):
 
     @staticmethod
     def draw_on_frame(
-            bgr_frame:np.ndarray,
+            rgb_frame:np.ndarray,
             detection_result:DetectionResult,
             inplace:bool=False
     ) -> np.ndarray:
         '''
-        静态方法，在BGR帧上绘制手部关键点
-        :param bgr_frame: 原始BGR帧
+        静态方法，在BGR帧上绘制手部关键点,但Mediapipe通道需要rgb图像
+        :param rgb_frame: 原始BGR帧
         :param detection_result: 包含landmarks的DetectionResult
         :param inplace: True=直接修改原帧，False=返回新帧
         :return: 标注后的BGR帧
         '''
         if not detection_result.valid or detection_result.landmarks is None:
-            return bgr_frame if inplace else bgr_frame.copy()
+            return rgb_frame if inplace else rgb_frame.copy()
 
-        output_frame=bgr_frame if inplace else bgr_frame.copy()
+        output_frame=rgb_frame if inplace else rgb_frame.copy()
 
         try:
             mp_hands = mp.tasks.vision.HandLandmarksConnections
@@ -115,4 +115,4 @@ class HandDetector(BaseDetector):
         except Exception as e:
             #可视化失败不应该阻塞主流程
             logging.getLogger('detector.hand').warning(f"Visualization failed: {e}")
-            return bgr_frame if inplace else bgr_frame.copy()
+            return rgb_frame if inplace else rgb_frame.copy()
